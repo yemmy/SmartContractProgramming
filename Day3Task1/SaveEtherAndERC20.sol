@@ -1,85 +1,126 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+// Minimal ERC20 interface
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+// Vault for saving ETH and ERC20 per user
 contract SaveEtherAndERC20 {
-    
-    mapping(address => uint256) public ethBalances;
-    mapping(address => mapping(address => uint256)) public tokenBalances;
-    
-    event Deposited(address indexed user, address indexed token, uint256 amount);
-    event Withdrawn(address indexed user, address indexed token, uint256 amount);
-    
-    // Deposit ETH
-    function depositETH() external payable {
-        require(msg.value > 0, "Amount must be > 0");
-        ethBalances[msg.sender] += msg.value;
-        emit Deposited(msg.sender, address(0), msg.value);
-    }
-    
-    // Deposit ERC20
-    function depositERC20(address token, uint256 amount) external {
-        require(token != address(0), "Invalid token");
-        require(amount > 0, "Amount must be > 0");
-        
-        transferFrom(msg.sender, address(this), amount);
-        tokenBalances[msg.sender][token] += amount;
-        
-        emit Deposited(msg.sender, token, amount);
-    }
-    
-    // Withdraw ETH
-    function withdrawETH(uint256 amount) external {
-        require(ethBalances[msg.sender] >= amount, "Insufficient ETH");
-        
-        ethBalances[msg.sender] -= amount;
-        payable(msg.sender).transfer(amount);
-        
-        emit Withdrawn(msg.sender, address(0), amount);
-    }
-    
-    // Withdraw ERC20
-    function withdrawERC20(address token, uint256 amount) external {
-        require(tokenBalances[msg.sender][token] >= amount, "Insufficient tokens");
-        
-        tokenBalances[msg.sender][token] -= amount;
-        transferFrom(address(this), msg.sender, amount);
-        
-        emit Withdrawn(msg.sender, token, amount);
-    }
-    
-    // Check balances
-    function getETHBalance(address user) external view returns (uint256) {
-        return ethBalances[user];
-    }
-    
-    function getTokenBalance(address user, address token) external view returns (uint256) {
-        return tokenBalances[user][token];
+    // Reentrancy guard
+    uint256 private _locked = 1;
+    modifier nonReentrant() {
+        require(_locked == 1, "Reentrancy");
+        _locked = 2;
+        _;
+        _locked = 1;
     }
 
-      function transferFrom(address from, address to, uint256 amount) public returns (bool) {
-        address spender = msg.sender;
-        _transfer(from, to, amount);
-        return true;
+    // User ETH balances
+    mapping(address => uint256) private _ethBalance;
+
+    // User token balances
+    mapping(address => mapping(address => uint256)) private _tokenBalance;
+
+    // Events
+    event EthDeposited(address indexed user, uint256 amount);
+    event EthWithdrawn(address indexed user, uint256 amount);
+    event TokenDeposited(address indexed user, address indexed token, uint256 amount);
+    event TokenWithdrawn(address indexed user, address indexed token, uint256 amount);
+
+    // View ETH balance
+    function ethBalanceOf(address user) external view returns (uint256) {
+        return _ethBalance[user];
     }
-    
-    // Internal transfer function
-    function _transfer(address from, address to, uint256 amount) internal {
-        require(from != address(0), "ERC20: transfer from zero address");
-        require(to != address(0), "ERC20: transfer to zero address");
-        require(to != address(this), "ERC20: transfer to contract itself");
-        
-        uint256 fromBalance = tokenBalances[from];
-        require(fromBalance >= amount, "ERC20: insufficient balance");
-        
-        // Check for overflow (though Solidity 0.8+ automatically checks)
-        require(tokenBalances[to] + amount >= tokenBalances[to], "ERC20: overflow");
-        
-        // Update balances
-        tokenBalances[from] = fromBalance - amount;
-        tokenBalances[to] += amount;
+
+    // View token balance
+    function tokenBalanceOf(address user, address token) external view returns (uint256) {
+        return _tokenBalance[user][token];
     }
-    
-    // Fallback
+
+    // Deposit ETH
+    function depositEth() external payable {
+        require(msg.value > 0, "No ETH");
+        _ethBalance[msg.sender] += msg.value;
+        emit EthDeposited(msg.sender, msg.value);
+    }
+
+    // Receive ETH directly
     receive() external payable {
+        require(msg.value > 0, "No ETH");
+        _ethBalance[msg.sender] += msg.value;
+        emit EthDeposited(msg.sender, msg.value);
+    }
+
+    // Withdraw ETH
+    function withdrawEth(uint256 amount) external nonReentrant {
+        require(amount > 0, "Zero");
+        uint256 bal = _ethBalance[msg.sender];
+        require(bal >= amount, "Insufficient");
+
+        _ethBalance[msg.sender] = bal - amount;
+
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Transfer failed");
+
+        emit EthWithdrawn(msg.sender, amount);
+    }
+
+    // Deposit ERC20 (requires approve)
+    function depositToken(address token, uint256 amount) external {
+        require(token != address(0), "Zero token");
+        require(amount > 0, "Zero");
+
+        bool ok = IERC20(token).transferFrom(msg.sender, address(this), amount);
+        require(ok, "transferFrom failed");
+
+        _tokenBalance[msg.sender][token] += amount;
+        emit TokenDeposited(msg.sender, token, amount);
+    }
+
+    // Withdraw ERC20
+    function withdrawToken(address token, uint256 amount) external nonReentrant {
+        require(token != address(0), "Zero token");
+        require(amount > 0, "Zero");
+
+        uint256 bal = _tokenBalance[msg.sender][token];
+        require(bal >= amount, "Insufficient");
+
+        _tokenBalance[msg.sender][token] = bal - amount;
+
+        bool ok = IERC20(token).transfer(msg.sender, amount);
+        require(ok, "Transfer failed");
+
+        emit TokenWithdrawn(msg.sender, token, amount);
+    }
+
+    // Withdraw all ETH
+    function withdrawAllEth() external nonReentrant {
+        uint256 amount = _ethBalance[msg.sender];
+        require(amount > 0, "No balance");
+
+        _ethBalance[msg.sender] = 0;
+
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Transfer failed");
+
+        emit EthWithdrawn(msg.sender, amount);
+    }
+
+    // Withdraw all of a token
+    function withdrawAllToken(address token) external nonReentrant {
+        require(token != address(0), "Zero token");
+
+        uint256 amount = _tokenBalance[msg.sender][token];
+        require(amount > 0, "No balance");
+
+        _tokenBalance[msg.sender][token] = 0;
+
+        bool ok = IERC20(token).transfer(msg.sender, amount);
+        require(ok, "Transfer failed");
+
+        emit TokenWithdrawn(msg.sender, token, amount);
     }
 }
